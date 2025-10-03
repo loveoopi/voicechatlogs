@@ -27,72 +27,61 @@ class VoiceChatMonitor:
         self.voice_chat_group_id = config.VOICE_CHAT_GROUP_ID
         
         # Track user states
-        self.user_states = {}  # user_id -> {muted: bool, last_update: datetime}
-        self.mute_history = defaultdict(lambda: deque(maxlen=10))  # user_id -> deque of mute/unmute timestamps
+        self.user_states = {}
+        self.mute_history = defaultdict(lambda: deque(maxlen=10))
         self.speaking_users = set()
-        
-        # Track current participants
-        self.current_participants = {}  # user_id -> user_info
+        self.current_participants = {}
         
         logger.info("Voice Chat Monitor initialized")
 
     async def start(self):
         """Start the monitoring service"""
-        await self.client.start(config.SESSION_STRING)
-        logger.info("Client started successfully")
-        
-        # Register event handlers
-        self.client.add_event_handler(
-            self.handle_voice_chat_update,
-            events.CallUpdated
-        )
-        
-        # Start periodic monitoring
-        asyncio.create_task(self.periodic_monitoring())
-        
-        logger.info("Voice Chat Monitor started")
-        await self.send_log_message("🚀 Voice Chat Monitor Started!")
-        
-        # Keep the client running
-        await self.client.run_until_disconnected()
+        try:
+            await self.client.start(config.SESSION_STRING)
+            logger.info("Client started successfully")
+            
+            # Register event handlers
+            self.client.add_event_handler(
+                self.handle_voice_chat_update,
+                events.CallUpdated
+            )
+            
+            # Start periodic monitoring
+            asyncio.create_task(self.periodic_monitoring())
+            
+            logger.info("Voice Chat Monitor started")
+            await self.send_log_message("🚀 Voice Chat Monitor Started!")
+            
+            # Keep the client running
+            await self.client.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"Failed to start: {e}")
+            raise
 
     async def handle_voice_chat_update(self, event):
         """Handle voice chat participant updates"""
         try:
-            if not hasattr(event.call, 'participants') or not event.call.participants:
+            if not hasattr(event, 'call') or not hasattr(event.call, 'participants'):
                 return
             
             call = event.call
             current_time = datetime.now()
             
-            # Update participant states
             for participant in event.call.participants:
                 user_id = participant.user_id
                 is_muted = participant.muted
                 
-                # Get user info
                 user_info = await self.get_user_info(user_id)
                 if not user_info:
                     continue
                 
-                # Update current participants
                 self.current_participants[user_id] = user_info
                 
                 # Check for state change
                 if user_id in self.user_states:
-                    previous_state = self.user_states[user_id]
-                    if previous_state['muted'] != is_muted:
-                        # State changed - log it
-                        await self.log_mute_change(
-                            user_info, 
-                            is_muted, 
-                            current_time
-                        )
-                        
-                        # Update mute history for spam detection
+                    if self.user_states[user_id]['muted'] != is_muted:
+                        await self.log_mute_change(user_info, is_muted, current_time)
                         self.mute_history[user_id].append(current_time)
-                        
-                        # Check for spam behavior
                         await self.check_mute_spam(user_id, user_info)
                 
                 # Update current state
@@ -121,9 +110,8 @@ class VoiceChatMonitor:
                 await asyncio.sleep(10)
 
     async def check_current_status(self):
-        """Check current voice chat status and log if needed"""
+        """Check current voice chat status"""
         try:
-            # Get current call information
             call = await self.client.get_call(config.VOICE_CHAT_GROUP_ID)
             if not call or not hasattr(call, 'participants'):
                 return
@@ -131,7 +119,6 @@ class VoiceChatMonitor:
             total_participants = len(call.participants)
             speaking_count = len([p for p in call.participants if not p.muted])
             
-            # Log significant changes
             if total_participants > 0:
                 await self.log_current_status(total_participants, speaking_count)
                 
@@ -148,9 +135,9 @@ class VoiceChatMonitor:
             
             if total_participants > 0:
                 message += "**Current Participants:**\n"
-                for user_id, user_info in list(self.current_participants.items())[:20]:  # Limit to first 20
+                for user_id, user_info in list(self.current_participants.items())[:20]:
                     speaking_indicator = "🎤 **SPEAKING**" if user_id in self.speaking_users else "🔇 Muted"
-                    message += f"• {user_info['name']} ({user_info['username']}) - {speaking_indicator}\n"
+                    message += f"• {user_info['name']} (@{user_info['username']}) - {speaking_indicator}\n"
                 
                 if total_participants > 20:
                     message += f"\n... and {total_participants - 20} more participants"
@@ -185,7 +172,6 @@ class VoiceChatMonitor:
             current_time = datetime.now()
             time_window = current_time - timedelta(seconds=config.TIME_WINDOW)
             
-            # Count actions in time window
             recent_actions = len([t for t in history if t > time_window])
             
             if recent_actions >= config.MUTE_SPAM_THRESHOLD:
@@ -198,8 +184,6 @@ class VoiceChatMonitor:
                 
                 await self.send_log_message(message)
                 logger.warning(f"Mute spam detected for user {user_info['name']}")
-                
-                # Clear history after reporting
                 self.mute_history[user_id].clear()
                 
         except Exception as e:
@@ -210,10 +194,14 @@ class VoiceChatMonitor:
         try:
             user = await self.client.get_entity(user_id)
             
+            username = getattr(user, 'username', 'No Username')
+            if not username or username == 'No Username':
+                username = 'no_username'
+            
             user_info = {
                 'user_id': user_id,
                 'name': f"{user.first_name or ''} {user.last_name or ''}".strip(),
-                'username': getattr(user, 'username', 'No Username')
+                'username': username
             }
             
             return user_info
@@ -230,10 +218,8 @@ class VoiceChatMonitor:
                 text=message,
                 parse_mode='Markdown'
             )
-        except TelegramError as e:
-            logger.error(f"Error sending log message: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error sending log message: {e}")
+            logger.error(f"Error sending log message: {e}")
 
     async def cleanup(self):
         """Cleanup resources"""
