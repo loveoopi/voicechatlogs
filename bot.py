@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import InputPeerChannel
 from telegram import Bot
 from telegram.error import TelegramError
 
@@ -39,6 +40,7 @@ class VoiceChatMonitor:
         self.mute_history = defaultdict(lambda: deque(maxlen=10))
         self.speaking_users = set()
         self.current_participants = {}
+        self.last_participants_count = 0
         
         logger.info("Voice Chat Monitor initialized")
 
@@ -55,38 +57,55 @@ class VoiceChatMonitor:
             me = await self.client.get_me()
             logger.info(f"Logged in as: {me.first_name} (@{me.username})")
             
-            # Send startup message (without Markdown to avoid parse errors)
+            # Send startup message
             await self.send_log_message(f"🚀 Voice Chat Monitor Started!\nLogged in as: {me.first_name} (@{me.username})")
             
-            # Register event handlers
-            self.client.add_event_handler(
-                self.handle_voice_chat_update,
-                events.CallUpdated
-            )
-            
-            # Start periodic monitoring
+            # Start periodic monitoring (we'll use polling instead of events)
             asyncio.create_task(self.periodic_monitoring())
             
             logger.info("Voice Chat Monitor started successfully")
             
             # Keep the client running
-            await self.client.run_until_disconnected()
+            await asyncio.Future()  # Run forever
             
         except Exception as e:
             logger.error(f"Failed to start: {str(e)}")
             await self.send_log_message(f"❌ Failed to start: {str(e)}")
             raise
 
-    async def handle_voice_chat_update(self, event):
-        """Handle voice chat participant updates"""
+    async def periodic_monitoring(self):
+        """Periodically check voice chat status"""
+        logger.info("Starting periodic monitoring...")
+        last_status = None
+        
+        while True:
+            try:
+                await self.check_voice_chat_status()
+                await asyncio.sleep(CHECK_INTERVAL)
+            except Exception as e:
+                logger.error(f"Error in periodic monitoring: {e}")
+                await asyncio.sleep(10)
+
+    async def check_voice_chat_status(self):
+        """Check current voice chat status and detect changes"""
         try:
-            if not hasattr(event, 'call') or not hasattr(event.call, 'participants'):
+            # Get current call information
+            call = await self.client.get_call(self.voice_chat_group_id)
+            if not call or not hasattr(call, 'participants'):
+                # No active voice chat
+                if self.current_participants:
+                    logger.info("Voice chat ended")
+                    await self.send_log_message("📞 Voice chat ended")
+                    self.current_participants.clear()
+                    self.user_states.clear()
+                    self.speaking_users.clear()
                 return
             
-            call = event.call
-            current_time = datetime.now()
+            current_participants = {}
+            current_speaking = set()
             
-            for participant in event.call.participants:
+            # Process each participant
+            for participant in call.participants:
                 user_id = participant.user_id
                 is_muted = participant.muted
                 
@@ -94,74 +113,62 @@ class VoiceChatMonitor:
                 if not user_info:
                     continue
                 
-                self.current_participants[user_id] = user_info
+                current_participants[user_id] = user_info
                 
-                # Check for state change
+                # Check for mute state changes
                 if user_id in self.user_states:
-                    if self.user_states[user_id]['muted'] != is_muted:
-                        await self.log_mute_change(user_info, is_muted, current_time)
-                        self.mute_history[user_id].append(current_time)
+                    previous_muted = self.user_states[user_id]['muted']
+                    if previous_muted != is_muted:
+                        await self.log_mute_change(user_info, is_muted, datetime.now())
+                        self.mute_history[user_id].append(datetime.now())
                         await self.check_mute_spam(user_id, user_info)
                 
                 # Update current state
                 self.user_states[user_id] = {
                     'muted': is_muted,
-                    'last_update': current_time
+                    'last_update': datetime.now()
                 }
                 
-                # Update speaking status
+                # Track speaking users
                 if not is_muted:
-                    self.speaking_users.add(user_id)
-                else:
-                    self.speaking_users.discard(user_id)
-                    
-        except Exception as e:
-            logger.error(f"Error handling voice chat update: {e}")
-
-    async def periodic_monitoring(self):
-        """Periodically check voice chat status"""
-        while True:
-            try:
-                await self.check_current_status()
-                await asyncio.sleep(CHECK_INTERVAL)
-            except Exception as e:
-                logger.error(f"Error in periodic monitoring: {e}")
-                await asyncio.sleep(10)
-
-    async def check_current_status(self):
-        """Check current voice chat status"""
-        try:
-            call = await self.client.get_call(self.voice_chat_group_id)
-            if not call or not hasattr(call, 'participants'):
-                return
+                    current_speaking.add(user_id)
             
+            # Update speaking users
+            self.speaking_users = current_speaking
+            self.current_participants = current_participants
+            
+            # Log status changes
             total_participants = len(call.participants)
-            speaking_count = len([p for p in call.participants if not p.muted])
+            speaking_count = len(current_speaking)
             
-            if total_participants > 0:
+            # Only log if there are changes
+            if (total_participants != self.last_participants_count or 
+                len(current_participants) != len(self.current_participants)):
+                
                 await self.log_current_status(total_participants, speaking_count)
+                self.last_participants_count = total_participants
                 
         except Exception as e:
-            logger.error(f"Error checking current status: {e}")
+            logger.error(f"Error checking voice chat status: {e}")
 
     async def log_current_status(self, total_participants, speaking_count):
         """Log current voice chat status"""
         try:
-            message = f"Voice Chat Status\n"
-            message += f"Total Participants: {total_participants}\n"
-            message += f"Currently Speaking: {speaking_count}\n"
-            message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            message = f"🎤 Voice Chat Status Update\n"
+            message += f"👥 Total Participants: {total_participants}\n"
+            message += f"🎤 Currently Speaking: {speaking_count}\n"
+            message += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             
             if total_participants > 0 and self.current_participants:
                 message += "Current Participants:\n"
                 count = 0
-                for user_id, user_info in list(self.current_participants.items())[:10]:
-                    speaking_indicator = "SPEAKING" if user_id in self.speaking_users else "Muted"
+                for user_id, user_info in list(self.current_participants.items())[:15]:  # Show first 15
+                    speaking_indicator = "🎤 SPEAKING" if user_id in self.speaking_users else "🔇 Muted"
                     message += f"• {user_info['name']} (@{user_info['username']}) - {speaking_indicator}\n"
                     count += 1
                 
-                if total_participants > 10:
-                    message += f"\n... and {total_participants - 10} more participants"
+                if total_participants > 15:
+                    message += f"\n... and {total_participants - 15} more participants"
             
             await self.send_log_message(message)
             
@@ -175,10 +182,10 @@ class VoiceChatMonitor:
             emoji = "🎤" if not is_muted else "🔇"
             
             message = f"{emoji} User {action.upper()}\n"
-            message += f"Name: {user_info['name']}\n"
-            message += f"Username: @{user_info['username']}\n"
-            message += f"User ID: {user_info['user_id']}\n"
-            message += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+            message += f"👤 Name: {user_info['name']}\n"
+            message += f"📱 Username: @{user_info['username']}\n"
+            message += f"🆔 User ID: {user_info['user_id']}\n"
+            message += f"⏰ Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
             
             await self.send_log_message(message)
             logger.info(f"User {user_info['name']} {action} at {timestamp}")
@@ -196,12 +203,12 @@ class VoiceChatMonitor:
             recent_actions = len([t for t in history if t > time_window])
             
             if recent_actions >= MUTE_SPAM_THRESHOLD:
-                message = f"MUTE/UNMUTE SPAM DETECTED\n"
-                message += f"User: {user_info['name']}\n"
-                message += f"Username: @{user_info['username']}\n"
-                message += f"User ID: {user_info['user_id']}\n"
-                message += f"Actions: {recent_actions} in {TIME_WINDOW} seconds\n"
-                message += f"Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                message = f"🚨 MUTE/UNMUTE SPAM DETECTED\n"
+                message += f"👤 User: {user_info['name']}\n"
+                message += f"📱 Username: @{user_info['username']}\n"
+                message += f"🆔 User ID: {user_info['user_id']}\n"
+                message += f"🔢 Actions: {recent_actions} in {TIME_WINDOW} seconds\n"
+                message += f"⏰ Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 await self.send_log_message(message)
                 logger.warning(f"Mute spam detected for user {user_info['name']}")
@@ -240,7 +247,6 @@ class VoiceChatMonitor:
     async def send_log_message(self, message):
         """Send message to log group"""
         try:
-            # Send without Markdown to avoid parse errors
             await self.bot.send_message(
                 chat_id=self.log_group_id,
                 text=message
