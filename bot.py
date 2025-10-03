@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 class VoiceChatMonitor:
     def __init__(self):
+        logger.info(f"Initializing with session string: {SESSION_STRING[:50]}...")
+        
         self.client = TelegramClient(
             "voice_monitor_session",
             API_ID,
@@ -39,18 +41,18 @@ class VoiceChatMonitor:
     async def start(self):
         """Start the monitoring service"""
         try:
-            await self.client.start(SESSION_STRING)
+            logger.info("Starting client...")
+            
+            # Start the client with session string
+            await self.client.start(session_string=SESSION_STRING)
             logger.info("Client started successfully")
             
-            # Test if we can access the voice chat
-            try:
-                call = await self.client.get_call(self.voice_chat_group_id)
-                if call:
-                    logger.info(f"Successfully connected to voice chat: {call}")
-                else:
-                    logger.info("No active voice chat found")
-            except Exception as e:
-                logger.warning(f"Could not access voice chat: {e}")
+            # Verify we're logged in
+            me = await self.client.get_me()
+            logger.info(f"Logged in as: {me.first_name} (@{me.username})")
+            
+            # Send startup message
+            await self.send_log_message(f"🚀 Voice Chat Monitor Started!\nLogged in as: {me.first_name} (@{me.username})")
             
             # Register event handlers
             self.client.add_event_handler(
@@ -61,13 +63,14 @@ class VoiceChatMonitor:
             # Start periodic monitoring
             asyncio.create_task(self.periodic_monitoring())
             
-            logger.info("Voice Chat Monitor started")
-            await self.send_log_message("🚀 Voice Chat Monitor Started!")
+            logger.info("Voice Chat Monitor started successfully")
             
             # Keep the client running
             await self.client.run_until_disconnected()
+            
         except Exception as e:
-            logger.error(f"Failed to start: {e}")
+            logger.error(f"Failed to start: {str(e)}")
+            await self.send_log_message(f"❌ Failed to start: {str(e)}")
             raise
 
     async def handle_voice_chat_update(self, event):
@@ -148,15 +151,13 @@ class VoiceChatMonitor:
             if total_participants > 0 and self.current_participants:
                 message += "**Current Participants:**\n"
                 count = 0
-                for user_id, user_info in self.current_participants.items():
-                    if count >= 20:  # Limit to first 20
-                        break
+                for user_id, user_info in list(self.current_participants.items())[:10]:  # Show first 10
                     speaking_indicator = "🎤 **SPEAKING**" if user_id in self.speaking_users else "🔇 Muted"
                     message += f"• {user_info['name']} (@{user_info['username']}) - {speaking_indicator}\n"
                     count += 1
                 
-                if total_participants > 20:
-                    message += f"\n... and {total_participants - 20} more participants"
+                if total_participants > 10:
+                    message += f"\n... and {total_participants - 10} more participants"
             
             await self.send_log_message(message)
             
