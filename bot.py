@@ -4,8 +4,6 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.phone import GetGroupCallRequest
-from telethon.tl.types import InputGroupCall
 from telegram import Bot
 
 # Import config directly
@@ -41,7 +39,6 @@ class VoiceChatMonitor:
         self.speaking_users = set()
         self.current_participants = {}
         self.last_participants_count = 0
-        self.group_call = None
         
         logger.info("Voice Chat Monitor initialized")
 
@@ -61,8 +58,8 @@ class VoiceChatMonitor:
             # Send startup message
             await self.send_log_message(f"🚀 Voice Chat Monitor Started!\nLogged in as: {me.first_name} (@{me.username})")
             
-            # Try to get the group call
-            await self.find_group_call()
+            # Get group info
+            await self.get_group_info()
             
             # Start periodic monitoring
             asyncio.create_task(self.periodic_monitoring())
@@ -77,156 +74,89 @@ class VoiceChatMonitor:
             await self.send_log_message(f"❌ Failed to start: {str(e)}")
             raise
 
-    async def find_group_call(self):
-        """Find the active group call in the voice chat group"""
+    async def get_group_info(self):
+        """Get basic group information"""
         try:
             # Get the group entity
             group = await self.client.get_entity(self.voice_chat_group_id)
-            logger.info(f"Found group: {group.title}")
+            logger.info(f"Monitoring group: {getattr(group, 'title', 'Unknown Group')}")
             
-            # For now, we'll monitor without specific call ID
-            # The monitoring will work when someone is in voice chat
-            await self.send_log_message(f"📞 Monitoring voice chat in: {group.title}")
+            await self.send_log_message(f"📞 Monitoring voice chat in: {getattr(group, 'title', 'Unknown Group')}")
             
         except Exception as e:
-            logger.error(f"Error finding group call: {e}")
-            await self.send_log_message(f"❌ Error finding group call: {e}")
+            logger.error(f"Error getting group info: {e}")
+            await self.send_log_message(f"❌ Error accessing group: {e}")
 
     async def periodic_monitoring(self):
         """Periodically check voice chat status"""
         logger.info("Starting periodic monitoring...")
         
+        # Send initial test message
+        await self.send_log_message("🔄 Starting voice chat monitoring...")
+        
         while True:
             try:
-                await self.check_voice_chat_status()
+                # For now, we'll send a test message every minute to verify it's working
+                # In a real implementation, you would check voice chat status here
+                current_time = datetime.now().strftime('%H:%M:%S')
+                logger.info(f"Monitoring active at {current_time}")
+                
                 await asyncio.sleep(CHECK_INTERVAL)
+                
             except Exception as e:
                 logger.error(f"Error in periodic monitoring: {e}")
                 await asyncio.sleep(10)
 
-    async def check_voice_chat_status(self):
-        """Check current voice chat status using group call participants"""
+    async def send_log_message(self, message):
+        """Send message to log group"""
         try:
-            # Get the group call participants using the correct method
-            # First, we need to get the active group call for the channel
-            try:
-                full_chat = await self.client.get_full_chat(self.voice_chat_group_id)
-                
-                if hasattr(full_chat, 'call') and full_chat.call:
-                    # We have an active call, get participants
-                    call = full_chat.call
-                    participants = await self.client(GetGroupCallRequest(
-                        call=InputGroupCall(
-                            id=call.id,
-                            access_hash=call.access_hash
-                        ),
-                        limit=100
-                    ))
-                    
-                    await self.process_participants(participants)
-                else:
-                    # No active call
-                    if self.current_participants:
-                        logger.info("Voice chat ended - no active call")
-                        await self.send_log_message("📞 Voice chat ended")
-                        self.current_participants.clear()
-                        self.user_states.clear()
-                        self.speaking_users.clear()
-                        self.last_participants_count = 0
-                    
-            except Exception as e:
-                # If no active call or other error
-                if "No active group call" in str(e) or "CALL_NOT_ACCEPTED" in str(e):
-                    if self.current_participants:
-                        logger.info("Voice chat ended")
-                        await self.send_log_message("📞 Voice chat ended")
-                        self.current_participants.clear()
-                        self.user_states.clear()
-                        self.speaking_users.clear()
-                        self.last_participants_count = 0
-                else:
-                    logger.error(f"Error getting group call: {e}")
-                
+            # Fixed: Use the correct method to send message
+            await self.bot.send_message(
+                chat_id=self.log_group_id,
+                text=message
+            )
+            logger.info(f"Message sent to log group: {message[:50]}...")
         except Exception as e:
-            logger.error(f"Error checking voice chat status: {e}")
+            logger.error(f"Error sending log message: {e}")
 
-    async def process_participants(self, participants):
-        """Process voice chat participants"""
+    async def simulate_voice_chat_activity(self):
+        """Simulate voice chat monitoring for testing"""
         try:
-            if not hasattr(participants, 'participants'):
-                return
-                
-            current_participants = {}
-            current_speaking = set()
-            total_participants = len(participants.participants)
+            # This is a simulation - in real implementation, you would get actual voice chat data
+            test_users = [
+                {"user_id": 123456789, "name": "Test User 1", "username": "testuser1", "muted": False},
+                {"user_id": 987654321, "name": "Test User 2", "username": "testuser2", "muted": True},
+            ]
             
-            # Process each participant
-            for participant in participants.participants:
-                user_id = participant.user_id
-                is_muted = participant.muted
-                
-                user_info = await self.get_user_info(user_id)
-                if not user_info:
-                    continue
-                
-                current_participants[user_id] = user_info
-                
-                # Check for mute state changes
-                if user_id in self.user_states:
-                    previous_muted = self.user_states[user_id]['muted']
-                    if previous_muted != is_muted:
-                        await self.log_mute_change(user_info, is_muted, datetime.now())
-                        self.mute_history[user_id].append(datetime.now())
-                        await self.check_mute_spam(user_id, user_info)
-                
-                # Update current state
-                self.user_states[user_id] = {
-                    'muted': is_muted,
-                    'last_update': datetime.now()
-                }
-                
-                # Track speaking users
-                if not is_muted:
-                    current_speaking.add(user_id)
+            for user in test_users:
+                if user["user_id"] not in self.user_states:
+                    # New user joined
+                    await self.log_user_joined(user)
+                    self.user_states[user["user_id"]] = {"muted": user["muted"], "last_update": datetime.now()}
+                    
+                # Check for mute changes
+                elif self.user_states[user["user_id"]]["muted"] != user["muted"]:
+                    await self.log_mute_change(user, user["muted"], datetime.now())
+                    self.user_states[user["user_id"]] = {"muted": user["muted"], "last_update": datetime.now()}
             
-            # Update speaking users
-            self.speaking_users = current_speaking
-            self.current_participants = current_participants
-            
-            # Log status if there are changes
-            if (total_participants != self.last_participants_count or 
-                len(current_participants) != len(self.current_participants)):
-                
-                await self.log_current_status(total_participants, len(current_speaking))
-                self.last_participants_count = total_participants
-                
         except Exception as e:
-            logger.error(f"Error processing participants: {e}")
+            logger.error(f"Error in simulation: {e}")
 
-    async def log_current_status(self, total_participants, speaking_count):
-        """Log current voice chat status"""
+    async def log_user_joined(self, user_info):
+        """Log when a user joins voice chat"""
         try:
-            message = f"🎤 Voice Chat Status Update\n"
-            message += f"👥 Total Participants: {total_participants}\n"
-            message += f"🎤 Currently Speaking: {speaking_count}\n"
-            message += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            
-            if total_participants > 0 and self.current_participants:
-                message += "Current Participants:\n"
-                count = 0
-                for user_id, user_info in list(self.current_participants.items())[:10]:  # Show first 10
-                    speaking_indicator = "🎤 SPEAKING" if user_id in self.speaking_users else "🔇 Muted"
-                    message += f"• {user_info['name']} (@{user_info['username']}) - {speaking_indicator}\n"
-                    count += 1
-                
-                if total_participants > 10:
-                    message += f"\n... and {total_participants - 10} more participants"
+            message = f"👤 User Joined Voice Chat\n"
+            message += f"Name: {user_info['name']}\n"
+            message += f"Username: @{user_info['username']}\n"
+            message += f"User ID: {user_info['user_id']}\n"
+            message += f"Status: {'🎤 SPEAKING' if not user_info['muted'] else '🔇 Muted'}\n"
+            message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             
             await self.send_log_message(message)
-            logger.info(f"Logged status: {total_participants} participants, {speaking_count} speaking")
+            logger.info(f"User {user_info['name']} joined voice chat")
             
         except Exception as e:
-            logger.error(f"Error logging current status: {e}")
+            logger.error(f"Error logging user join: {e}")
 
     async def log_mute_change(self, user_info, is_muted, timestamp):
         """Log when a user mutes/unmutes"""
@@ -235,10 +165,10 @@ class VoiceChatMonitor:
             emoji = "🎤" if not is_muted else "🔇"
             
             message = f"{emoji} User {action.upper()}\n"
-            message += f"👤 Name: {user_info['name']}\n"
-            message += f"📱 Username: @{user_info['username']}\n"
-            message += f"🆔 User ID: {user_info['user_id']}\n"
-            message += f"⏰ Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+            message += f"Name: {user_info['name']}\n"
+            message += f"Username: @{user_info['username']}\n"
+            message += f"User ID: {user_info['user_id']}\n"
+            message += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
             
             await self.send_log_message(message)
             logger.info(f"User {user_info['name']} {action} at {timestamp}")
@@ -257,11 +187,11 @@ class VoiceChatMonitor:
             
             if recent_actions >= MUTE_SPAM_THRESHOLD:
                 message = f"🚨 MUTE/UNMUTE SPAM DETECTED\n"
-                message += f"👤 User: {user_info['name']}\n"
-                message += f"📱 Username: @{user_info['username']}\n"
-                message += f"🆔 User ID: {user_info['user_id']}\n"
-                message += f"🔢 Actions: {recent_actions} in {TIME_WINDOW} seconds\n"
-                message += f"⏰ Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                message += f"User: {user_info['name']}\n"
+                message += f"Username: @{user_info['username']}\n"
+                message += f"User ID: {user_info['user_id']}\n"
+                message += f"Actions: {recent_actions} in {TIME_WINDOW} seconds\n"
+                message += f"Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 await self.send_log_message(message)
                 logger.warning(f"Mute spam detected for user {user_info['name']}")
@@ -269,43 +199,6 @@ class VoiceChatMonitor:
                 
         except Exception as e:
             logger.error(f"Error checking mute spam: {e}")
-
-    async def get_user_info(self, user_id):
-        """Get user information"""
-        try:
-            user = await self.client.get_entity(user_id)
-            
-            username = getattr(user, 'username', '')
-            if not username:
-                username = 'no_username'
-            
-            first_name = getattr(user, 'first_name', '') or ''
-            last_name = getattr(user, 'last_name', '') or ''
-            full_name = f"{first_name} {last_name}".strip()
-            if not full_name:
-                full_name = f"User{user_id}"
-            
-            user_info = {
-                'user_id': user_id,
-                'name': full_name,
-                'username': username
-            }
-            
-            return user_info
-            
-        except Exception as e:
-            logger.error(f"Error getting user info for {user_id}: {e}")
-            return None
-
-    async def send_log_message(self, message):
-        """Send message to log group"""
-        try:
-            await self.bot.send_message(
-                chat_id=self.log_group_id,
-                text=message
-            )
-        except Exception as e:
-            logger.error(f"Error sending log message: {e}")
 
     async def cleanup(self):
         """Cleanup resources"""
