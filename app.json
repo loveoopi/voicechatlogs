@@ -7,27 +7,33 @@
   "env": {
     "API_ID": {
       "description": "Your Telegram API ID",
-      "value": "20284828"
+      "value": "20284828",
+      "required": true
     },
     "API_HASH": {
       "description": "Your Telegram API Hash",
-      "value": "a980ba25306901d5c9b899414d6a9ab7"
+      "value": "a980ba25306901d5c9b899414d6a9ab7",
+      "required": true
     },
     "SESSION_STRING": {
-      "description": "Your Telegram session string",
-      "value": "BQCOaU4AFyBoZE7vS3lu3y7ZU4Tzv5qKCg3NoK58e8paOkFYvfS8ZE59ebB_vd4oW_hixs0BOQgJFJCFWjKZZ4kUYOZl3GLgzjcYwbmed5LPGlAbIaw8XQ5-XHBbhZylQwz1Jpqj0uHxj9J0a4gJDiWnUR5owJYIWg07l5VyZWEqtQvAiaDLTSo9Wij-Svf0QfGqUglRs_UrcGTGAGaLJgZXCJ0wAHq-DTSafRTQhCdhBzkLCQA1Sj9vJKnZuzmzK-qgq57NPbz_Sp3aEfxQ0dLr1tUTSrZDlQZqAak7WPznEK0Ef3SfUjlf_9yCctKgrOD3sbhjuAaxeIMnSDpuozEYzIfe9wAAAAHrrzhRAA"
+      "description": "Your Telegram session string - GET THIS FROM HEROKU CONFIG AFTER DEPLOYMENT",
+      "value": "PLEASE_SET_THIS_IN_HEROKU_CONFIG",
+      "required": true
     },
     "BOT_TOKEN": {
       "description": "Your bot token for logging",
-      "value": "8407166947:AAH5AU_791k4Qyc8X29sT-KwO9dnflGvvEo"
+      "value": "8407166947:AAH5AU_791k4Qyc8X29sT-KwO9dnflGvvEo",
+      "required": true
     },
     "LOG_GROUP_ID": {
       "description": "Log group ID",
-      "value": "-1003021229800"
+      "value": "-1003021229800",
+      "required": true
     },
     "VOICE_CHAT_GROUP_ID": {
       "description": "Voice chat group ID",
-      "value": "-1001887313554"
+      "value": "-1001887313554",
+      "required": true
     }
   },
   "buildpacks": [
