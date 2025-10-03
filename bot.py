@@ -2,11 +2,11 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import InputPeerChannel
+from telethon.tl.functions.phone import GetGroupCallRequest
+from telethon.tl.types import InputGroupCall
 from telegram import Bot
-from telegram.error import TelegramError
 
 # Import config directly
 from config import API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, LOG_GROUP_ID, VOICE_CHAT_GROUP_ID, CHECK_INTERVAL, MUTE_SPAM_THRESHOLD, TIME_WINDOW
@@ -41,6 +41,7 @@ class VoiceChatMonitor:
         self.speaking_users = set()
         self.current_participants = {}
         self.last_participants_count = 0
+        self.group_call = None
         
         logger.info("Voice Chat Monitor initialized")
 
@@ -60,7 +61,10 @@ class VoiceChatMonitor:
             # Send startup message
             await self.send_log_message(f"🚀 Voice Chat Monitor Started!\nLogged in as: {me.first_name} (@{me.username})")
             
-            # Start periodic monitoring (we'll use polling instead of events)
+            # Try to get the group call
+            await self.find_group_call()
+            
+            # Start periodic monitoring
             asyncio.create_task(self.periodic_monitoring())
             
             logger.info("Voice Chat Monitor started successfully")
@@ -73,10 +77,24 @@ class VoiceChatMonitor:
             await self.send_log_message(f"❌ Failed to start: {str(e)}")
             raise
 
+    async def find_group_call(self):
+        """Find the active group call in the voice chat group"""
+        try:
+            # Get the group entity
+            group = await self.client.get_entity(self.voice_chat_group_id)
+            logger.info(f"Found group: {group.title}")
+            
+            # For now, we'll monitor without specific call ID
+            # The monitoring will work when someone is in voice chat
+            await self.send_log_message(f"📞 Monitoring voice chat in: {group.title}")
+            
+        except Exception as e:
+            logger.error(f"Error finding group call: {e}")
+            await self.send_log_message(f"❌ Error finding group call: {e}")
+
     async def periodic_monitoring(self):
         """Periodically check voice chat status"""
         logger.info("Starting periodic monitoring...")
-        last_status = None
         
         while True:
             try:
@@ -87,25 +105,63 @@ class VoiceChatMonitor:
                 await asyncio.sleep(10)
 
     async def check_voice_chat_status(self):
-        """Check current voice chat status and detect changes"""
+        """Check current voice chat status using group call participants"""
         try:
-            # Get current call information
-            call = await self.client.get_call(self.voice_chat_group_id)
-            if not call or not hasattr(call, 'participants'):
-                # No active voice chat
-                if self.current_participants:
-                    logger.info("Voice chat ended")
-                    await self.send_log_message("📞 Voice chat ended")
-                    self.current_participants.clear()
-                    self.user_states.clear()
-                    self.speaking_users.clear()
+            # Get the group call participants using the correct method
+            # First, we need to get the active group call for the channel
+            try:
+                full_chat = await self.client.get_full_chat(self.voice_chat_group_id)
+                
+                if hasattr(full_chat, 'call') and full_chat.call:
+                    # We have an active call, get participants
+                    call = full_chat.call
+                    participants = await self.client(GetGroupCallRequest(
+                        call=InputGroupCall(
+                            id=call.id,
+                            access_hash=call.access_hash
+                        ),
+                        limit=100
+                    ))
+                    
+                    await self.process_participants(participants)
+                else:
+                    # No active call
+                    if self.current_participants:
+                        logger.info("Voice chat ended - no active call")
+                        await self.send_log_message("📞 Voice chat ended")
+                        self.current_participants.clear()
+                        self.user_states.clear()
+                        self.speaking_users.clear()
+                        self.last_participants_count = 0
+                    
+            except Exception as e:
+                # If no active call or other error
+                if "No active group call" in str(e) or "CALL_NOT_ACCEPTED" in str(e):
+                    if self.current_participants:
+                        logger.info("Voice chat ended")
+                        await self.send_log_message("📞 Voice chat ended")
+                        self.current_participants.clear()
+                        self.user_states.clear()
+                        self.speaking_users.clear()
+                        self.last_participants_count = 0
+                else:
+                    logger.error(f"Error getting group call: {e}")
+                
+        except Exception as e:
+            logger.error(f"Error checking voice chat status: {e}")
+
+    async def process_participants(self, participants):
+        """Process voice chat participants"""
+        try:
+            if not hasattr(participants, 'participants'):
                 return
-            
+                
             current_participants = {}
             current_speaking = set()
+            total_participants = len(participants.participants)
             
             # Process each participant
-            for participant in call.participants:
+            for participant in participants.participants:
                 user_id = participant.user_id
                 is_muted = participant.muted
                 
@@ -137,19 +193,15 @@ class VoiceChatMonitor:
             self.speaking_users = current_speaking
             self.current_participants = current_participants
             
-            # Log status changes
-            total_participants = len(call.participants)
-            speaking_count = len(current_speaking)
-            
-            # Only log if there are changes
+            # Log status if there are changes
             if (total_participants != self.last_participants_count or 
                 len(current_participants) != len(self.current_participants)):
                 
-                await self.log_current_status(total_participants, speaking_count)
+                await self.log_current_status(total_participants, len(current_speaking))
                 self.last_participants_count = total_participants
                 
         except Exception as e:
-            logger.error(f"Error checking voice chat status: {e}")
+            logger.error(f"Error processing participants: {e}")
 
     async def log_current_status(self, total_participants, speaking_count):
         """Log current voice chat status"""
@@ -162,15 +214,16 @@ class VoiceChatMonitor:
             if total_participants > 0 and self.current_participants:
                 message += "Current Participants:\n"
                 count = 0
-                for user_id, user_info in list(self.current_participants.items())[:15]:  # Show first 15
+                for user_id, user_info in list(self.current_participants.items())[:10]:  # Show first 10
                     speaking_indicator = "🎤 SPEAKING" if user_id in self.speaking_users else "🔇 Muted"
                     message += f"• {user_info['name']} (@{user_info['username']}) - {speaking_indicator}\n"
                     count += 1
                 
-                if total_participants > 15:
-                    message += f"\n... and {total_participants - 15} more participants"
+                if total_participants > 10:
+                    message += f"\n... and {total_participants - 10} more participants"
             
             await self.send_log_message(message)
+            logger.info(f"Logged status: {total_participants} participants, {speaking_count} speaking")
             
         except Exception as e:
             logger.error(f"Error logging current status: {e}")
