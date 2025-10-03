@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telegram import Bot
 from telegram.error import TelegramError
 
@@ -20,10 +21,13 @@ class VoiceChatMonitor:
     def __init__(self):
         logger.info(f"Initializing with session string: {SESSION_STRING[:50]}...")
         
+        # Create StringSession from the session string
+        session = StringSession(SESSION_STRING)
+        
         self.client = TelegramClient(
-            "voice_monitor_session",
-            API_ID,
-            API_HASH
+            session=session,
+            api_id=API_ID,
+            api_hash=API_HASH
         )
         
         self.bot = Bot(token=BOT_TOKEN)
@@ -43,15 +47,15 @@ class VoiceChatMonitor:
         try:
             logger.info("Starting client...")
             
-            # Start the client with session string
-            await self.client.start(session_string=SESSION_STRING)
+            # Start the client
+            await self.client.start()
             logger.info("Client started successfully")
             
             # Verify we're logged in
             me = await self.client.get_me()
             logger.info(f"Logged in as: {me.first_name} (@{me.username})")
             
-            # Send startup message
+            # Send startup message (without Markdown to avoid parse errors)
             await self.send_log_message(f"🚀 Voice Chat Monitor Started!\nLogged in as: {me.first_name} (@{me.username})")
             
             # Register event handlers
@@ -143,16 +147,16 @@ class VoiceChatMonitor:
     async def log_current_status(self, total_participants, speaking_count):
         """Log current voice chat status"""
         try:
-            message = f"🎤 **Voice Chat Status**\n"
-            message += f"👥 Total Participants: {total_participants}\n"
-            message += f"🎤 Currently Speaking: {speaking_count}\n"
-            message += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            message = f"Voice Chat Status\n"
+            message += f"Total Participants: {total_participants}\n"
+            message += f"Currently Speaking: {speaking_count}\n"
+            message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             
             if total_participants > 0 and self.current_participants:
-                message += "**Current Participants:**\n"
+                message += "Current Participants:\n"
                 count = 0
-                for user_id, user_info in list(self.current_participants.items())[:10]:  # Show first 10
-                    speaking_indicator = "🎤 **SPEAKING**" if user_id in self.speaking_users else "🔇 Muted"
+                for user_id, user_info in list(self.current_participants.items())[:10]:
+                    speaking_indicator = "SPEAKING" if user_id in self.speaking_users else "Muted"
                     message += f"• {user_info['name']} (@{user_info['username']}) - {speaking_indicator}\n"
                     count += 1
                 
@@ -170,11 +174,11 @@ class VoiceChatMonitor:
             action = "unmuted" if not is_muted else "muted"
             emoji = "🎤" if not is_muted else "🔇"
             
-            message = f"{emoji} **User {action.upper()}**\n"
-            message += f"👤 Name: {user_info['name']}\n"
-            message += f"📱 Username: @{user_info['username']}\n"
-            message += f"🆔 User ID: `{user_info['user_id']}`\n"
-            message += f"⏰ Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+            message = f"{emoji} User {action.upper()}\n"
+            message += f"Name: {user_info['name']}\n"
+            message += f"Username: @{user_info['username']}\n"
+            message += f"User ID: {user_info['user_id']}\n"
+            message += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
             
             await self.send_log_message(message)
             logger.info(f"User {user_info['name']} {action} at {timestamp}")
@@ -192,12 +196,12 @@ class VoiceChatMonitor:
             recent_actions = len([t for t in history if t > time_window])
             
             if recent_actions >= MUTE_SPAM_THRESHOLD:
-                message = f"🚨 **MUTE/UNMUTE SPAM DETECTED**\n"
-                message += f"👤 User: {user_info['name']}\n"
-                message += f"📱 Username: @{user_info['username']}\n"
-                message += f"🆔 User ID: `{user_info['user_id']}`\n"
-                message += f"🔢 Actions: {recent_actions} in {TIME_WINDOW} seconds\n"
-                message += f"⏰ Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                message = f"MUTE/UNMUTE SPAM DETECTED\n"
+                message += f"User: {user_info['name']}\n"
+                message += f"Username: @{user_info['username']}\n"
+                message += f"User ID: {user_info['user_id']}\n"
+                message += f"Actions: {recent_actions} in {TIME_WINDOW} seconds\n"
+                message += f"Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 await self.send_log_message(message)
                 logger.warning(f"Mute spam detected for user {user_info['name']}")
@@ -236,10 +240,10 @@ class VoiceChatMonitor:
     async def send_log_message(self, message):
         """Send message to log group"""
         try:
+            # Send without Markdown to avoid parse errors
             await self.bot.send_message(
                 chat_id=self.log_group_id,
-                text=message,
-                parse_mode='Markdown'
+                text=message
             )
         except Exception as e:
             logger.error(f"Error sending log message: {e}")
