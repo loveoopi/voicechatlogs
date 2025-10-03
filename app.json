@@ -1,0 +1,38 @@
+{
+  "name": "Telegram Voice Chat Monitor",
+  "description": "A userbot to monitor Telegram voice chat activities",
+  "repository": "https://github.com/your-username/telegram-voice-monitor",
+  "logo": "https://img.icons8.com/color/48/000000/telegram-app.png",
+  "keywords": ["telegram", "userbot", "voice-chat", "monitor"],
+  "env": {
+    "API_ID": {
+      "description": "Your Telegram API ID",
+      "value": "20284828"
+    },
+    "API_HASH": {
+      "description": "Your Telegram API Hash",
+      "value": "a980ba25306901d5c9b899414d6a9ab7"
+    },
+    "SESSION_STRING": {
+      "description": "Your Telegram session string",
+      "value": "BQCOaU4AFyBoZE7vS3lu3y7ZU4Tzv5qKCg3NoK58e8paOkFYvfS8ZE59ebB_vd4oW_hixs0BOQgJFJCFWjKZZ4kUYOZl3GLgzjcYwbmed5LPGlAbIaw8XQ5-XHBbhZylQwz1Jpqj0uHxj9J0a4gJDiWnUR5owJYIWg07l5VyZWEqtQvAiaDLTSo9Wij-Svf0QfGqUglRs_UrcGTGAGaLJgZXCJ0wAHq-DTSafRTQhCdhBzkLCQA1Sj9vJKnZuzmzK-qgq57NPbz_Sp3aEfxQ0dLr1tUTSrZDlQZqAak7WPznEK0Ef3SfUjlf_9yCctKgrOD3sbhjuAaxeIMnSDpuozEYzIfe9wAAAAHrrzhRAA"
+    },
+    "BOT_TOKEN": {
+      "description": "Your bot token for logging",
+      "value": "8407166947:AAH5AU_791k4Qyc8X29sT-KwO9dnflGvvEo"
+    },
+    "LOG_GROUP_ID": {
+      "description": "Log group ID",
+      "value": "-1003021229800"
+    },
+    "VOICE_CHAT_GROUP_ID": {
+      "description": "Voice chat group ID",
+      "value": "-1001887313554"
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
