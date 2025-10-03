@@ -5,7 +5,9 @@ from collections import defaultdict, deque
 from telethon import TelegramClient, events
 from telegram import Bot
 from telegram.error import TelegramError
-import config
+
+# Import config directly
+from config import API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, LOG_GROUP_ID, VOICE_CHAT_GROUP_ID, CHECK_INTERVAL, MUTE_SPAM_THRESHOLD, TIME_WINDOW
 
 # Setup logging
 logging.basicConfig(
@@ -18,13 +20,13 @@ class VoiceChatMonitor:
     def __init__(self):
         self.client = TelegramClient(
             "voice_monitor_session",
-            config.API_ID,
-            config.API_HASH
+            API_ID,
+            API_HASH
         )
         
-        self.bot = Bot(token=config.BOT_TOKEN)
-        self.log_group_id = config.LOG_GROUP_ID
-        self.voice_chat_group_id = config.VOICE_CHAT_GROUP_ID
+        self.bot = Bot(token=BOT_TOKEN)
+        self.log_group_id = LOG_GROUP_ID
+        self.voice_chat_group_id = VOICE_CHAT_GROUP_ID
         
         # Track user states
         self.user_states = {}
@@ -37,8 +39,18 @@ class VoiceChatMonitor:
     async def start(self):
         """Start the monitoring service"""
         try:
-            await self.client.start(config.SESSION_STRING)
+            await self.client.start(SESSION_STRING)
             logger.info("Client started successfully")
+            
+            # Test if we can access the voice chat
+            try:
+                call = await self.client.get_call(self.voice_chat_group_id)
+                if call:
+                    logger.info(f"Successfully connected to voice chat: {call}")
+                else:
+                    logger.info("No active voice chat found")
+            except Exception as e:
+                logger.warning(f"Could not access voice chat: {e}")
             
             # Register event handlers
             self.client.add_event_handler(
@@ -104,7 +116,7 @@ class VoiceChatMonitor:
         while True:
             try:
                 await self.check_current_status()
-                await asyncio.sleep(config.CHECK_INTERVAL)
+                await asyncio.sleep(CHECK_INTERVAL)
             except Exception as e:
                 logger.error(f"Error in periodic monitoring: {e}")
                 await asyncio.sleep(10)
@@ -112,7 +124,7 @@ class VoiceChatMonitor:
     async def check_current_status(self):
         """Check current voice chat status"""
         try:
-            call = await self.client.get_call(config.VOICE_CHAT_GROUP_ID)
+            call = await self.client.get_call(self.voice_chat_group_id)
             if not call or not hasattr(call, 'participants'):
                 return
             
@@ -133,11 +145,15 @@ class VoiceChatMonitor:
             message += f"🎤 Currently Speaking: {speaking_count}\n"
             message += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             
-            if total_participants > 0:
+            if total_participants > 0 and self.current_participants:
                 message += "**Current Participants:**\n"
-                for user_id, user_info in list(self.current_participants.items())[:20]:
+                count = 0
+                for user_id, user_info in self.current_participants.items():
+                    if count >= 20:  # Limit to first 20
+                        break
                     speaking_indicator = "🎤 **SPEAKING**" if user_id in self.speaking_users else "🔇 Muted"
                     message += f"• {user_info['name']} (@{user_info['username']}) - {speaking_indicator}\n"
+                    count += 1
                 
                 if total_participants > 20:
                     message += f"\n... and {total_participants - 20} more participants"
@@ -170,16 +186,16 @@ class VoiceChatMonitor:
         try:
             history = self.mute_history[user_id]
             current_time = datetime.now()
-            time_window = current_time - timedelta(seconds=config.TIME_WINDOW)
+            time_window = current_time - timedelta(seconds=TIME_WINDOW)
             
             recent_actions = len([t for t in history if t > time_window])
             
-            if recent_actions >= config.MUTE_SPAM_THRESHOLD:
+            if recent_actions >= MUTE_SPAM_THRESHOLD:
                 message = f"🚨 **MUTE/UNMUTE SPAM DETECTED**\n"
                 message += f"👤 User: {user_info['name']}\n"
                 message += f"📱 Username: @{user_info['username']}\n"
                 message += f"🆔 User ID: `{user_info['user_id']}`\n"
-                message += f"🔢 Actions: {recent_actions} in {config.TIME_WINDOW} seconds\n"
+                message += f"🔢 Actions: {recent_actions} in {TIME_WINDOW} seconds\n"
                 message += f"⏰ Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 await self.send_log_message(message)
@@ -194,13 +210,19 @@ class VoiceChatMonitor:
         try:
             user = await self.client.get_entity(user_id)
             
-            username = getattr(user, 'username', 'No Username')
-            if not username or username == 'No Username':
+            username = getattr(user, 'username', '')
+            if not username:
                 username = 'no_username'
+            
+            first_name = getattr(user, 'first_name', '') or ''
+            last_name = getattr(user, 'last_name', '') or ''
+            full_name = f"{first_name} {last_name}".strip()
+            if not full_name:
+                full_name = f"User{user_id}"
             
             user_info = {
                 'user_id': user_id,
-                'name': f"{user.first_name or ''} {user.last_name or ''}".strip(),
+                'name': full_name,
                 'username': username
             }
             
