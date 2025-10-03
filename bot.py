@@ -3,7 +3,6 @@ import logging
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from telethon import TelegramClient, events
-from telethon.tl.types import Channel, Chat, User
 from telegram import Bot
 from telegram.error import TelegramError
 import config
