@@ -3,14 +3,14 @@ import logging
 from datetime import datetime
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel
-from telethon.tl.functions.channels import EditBannedRequest
+from telethon.tl.types import Channel, User
+from telethon.tl.functions.channels import EditBannedRequest, GetFullChannelRequest
 from telethon.tl.types import ChatBannedRights
 from telethon.errors import FloodWaitError
 from telegram import Bot
 
 # Import config directly
-from config import API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, LOG_GROUP_ID, VOICE_CHAT_GROUP_ID, CHECK_INTERVAL
+from config import API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, LOG_GROUP_ID, VOICE_CHAT_GROUP_ID
 
 # Setup logging
 logging.basicConfig(
@@ -38,7 +38,7 @@ class ChannelBanMonitor:
         
         # Track banned channels to avoid duplicate actions
         self.banned_channels = set()
-        self.processed_participants = set()
+        self.last_participants = set()
         
         logger.info("Channel Ban Monitor initialized")
 
@@ -81,71 +81,64 @@ class ChannelBanMonitor:
             group_title = getattr(group, 'title', 'Unknown Group')
             logger.info(f"Monitoring group: {group_title}")
             
-            await self.send_log_message(f"📞 Monitoring voice chat in: {group_title}\n🚫 Auto-banning all channels\n⚡ Scan interval: 3-4 seconds")
+            await self.send_log_message(f"📞 Monitoring voice chat in: {group_title}\n🚫 Auto-banning all channels\n⚡ Scan interval: 3 seconds")
             
         except Exception as e:
             logger.error(f"Error getting group info: {e}")
             await self.send_log_message(f"❌ Error accessing group: {e}")
 
-    async def is_channel(self, user):
-        """Check if a user is a channel with robust error handling"""
+    async def is_channel_participant(self, participant):
+        """Check if a participant is a channel by examining their user object"""
         try:
-            # Method 1: Check if it's a Channel type
-            if isinstance(user, Channel):
-                return True
+            user_id = participant.id
             
-            # Method 2: Check user attributes
-            if hasattr(user, 'bot') and user.bot:
+            # Get full user info
+            try:
+                user = await self.client.get_entity(user_id)
+            except Exception as e:
+                logger.error(f"Error getting user entity {user_id}: {e}")
                 return False
-                
-            # Method 3: Check for channel-specific attributes
-            if hasattr(user, 'broadcast') and user.broadcast:
-                return True
-                
-            if hasattr(user, 'megagroup') and user.megagroup:
-                return True
-                
-            # Method 4: Check username patterns (safe handling)
-            if hasattr(user, 'username') and user.username:
-                username_lower = user.username.lower() if user.username else ""
-                if username_lower and any(pattern in username_lower for pattern in ['channel', 'chat', 'group', 'bot']):
-                    return True
-                    
-            # Method 5: Check name patterns with safe handling
-            first_name = getattr(user, 'first_name', '') or ''
-            last_name = getattr(user, 'last_name', '') or ''
-            
-            # Convert to lowercase safely
-            first_name_lower = first_name.lower() if first_name else ''
-            last_name_lower = last_name.lower() if last_name else ''
-            full_name = f"{first_name} {last_name}".strip().lower()
-            
-            channel_keywords = ['channel', 'chat', 'group', 'news', 'broadcast', 'telegram']
-            
-            # Check each name part safely
-            if any(keyword in first_name_lower for keyword in channel_keywords if first_name_lower):
-                return True
-            if any(keyword in last_name_lower for keyword in channel_keywords if last_name_lower):
-                return True
-            if any(keyword in full_name for keyword in channel_keywords if full_name):
-                return True
-                
-            # Method 6: Check if it has no personal name but has username (common for channels)
-            if not first_name and not last_name and hasattr(user, 'username') and user.username:
-                return True
-                
-            # Method 7: Check for verified channels
-            if hasattr(user, 'verified') and user.verified:
+
+            # Method 1: Direct type check
+            if isinstance(user, Channel):
+                logger.info(f"Detected channel by type: {getattr(user, 'title', 'Unknown')} (ID: {user_id})")
                 return True
 
-            # Method 8: Check participant count (channels usually have participants)
-            if hasattr(user, 'participants_count') and getattr(user, 'participants_count', 0) > 0:
+            # Method 2: Check for broadcast flag
+            if hasattr(user, 'broadcast') and user.broadcast:
+                logger.info(f"Detected channel by broadcast flag: {getattr(user, 'title', 'Unknown')} (ID: {user_id})")
                 return True
-                
+
+            # Method 3: Check for megagroup flag
+            if hasattr(user, 'megagroup') and user.megagroup:
+                logger.info(f"Detected channel by megagroup flag: {getattr(user, 'title', 'Unknown')} (ID: {user_id})")
+                return True
+
+            # Method 4: Check participant count (channels have participants_count > 0)
+            if hasattr(user, 'participants_count') and getattr(user, 'participants_count', 0) > 0:
+                logger.info(f"Detected channel by participants count: {getattr(user, 'title', 'Unknown')} (ID: {user_id})")
+                return True
+
+            # Method 5: Check if it's a channel by username pattern and lack of personal info
+            username = getattr(user, 'username', '')
+            first_name = getattr(user, 'first_name', '')
+            last_name = getattr(user, 'last_name', '')
+            title = getattr(user, 'title', '')
+
+            # If it has a title but no first/last name, it's likely a channel
+            if title and not first_name and not last_name:
+                logger.info(f"Detected channel by title only: {title} (ID: {user_id})")
+                return True
+
+            # If it has channel-like username and no personal name
+            if username and any(keyword in username.lower() for keyword in ['channel', 'chat', 'group']) and not first_name:
+                logger.info(f"Detected channel by username pattern: {username} (ID: {user_id})")
+                return True
+
             return False
             
         except Exception as e:
-            logger.error(f"Error checking if user is channel: {e}")
+            logger.error(f"Error checking if participant is channel: {e}")
             return False
 
     async def ban_channel(self, channel_id, channel_info):
@@ -223,28 +216,38 @@ class ChannelBanMonitor:
         try:
             group = await self.client.get_entity(self.voice_chat_group_id)
             
-            # Get all participants in the voice chat
-            recent_participants = []
+            # Get all current participants
+            current_participants = set()
+            participants_list = []
+            
             try:
-                async for user in self.client.iter_participants(group, limit=200):  # Increased limit
-                    recent_participants.append(user)
+                async for user in self.client.iter_participants(group, limit=150):
+                    current_participants.add(user.id)
+                    participants_list.append(user)
             except FloodWaitError as e:
                 logger.warning(f"Flood wait getting participants: {e.seconds}s")
                 await asyncio.sleep(e.seconds)
                 return
             
+            # Find new participants
+            new_participants = current_participants - self.last_participants
+            
+            if new_participants:
+                logger.info(f"Found {len(new_participants)} new participants")
+            
             channels_found = 0
             
-            for participant in recent_participants:
+            # Check all participants, but focus on new ones
+            for participant in participants_list:
                 if participant.bot:
                     continue
                     
-                # Skip if already processed and banned
-                if participant.id in self.processed_participants:
+                # Skip if already banned
+                if participant.id in self.banned_channels:
                     continue
                     
                 # Check if it's a channel
-                if await self.is_channel(participant):
+                if await self.is_channel_participant(participant):
                     user_id = participant.id
                     username = getattr(participant, 'username', '')
                     first_name = getattr(participant, 'first_name', '')
@@ -267,13 +270,15 @@ class ChannelBanMonitor:
                         'username': username
                     }
                     
+                    logger.info(f"Attempting to ban channel: {display_name} (ID: {user_id})")
+                    
                     # Ban the channel immediately
                     success = await self.ban_channel(user_id, channel_info)
                     if success:
                         channels_found += 1
-                
-                # Mark as processed regardless of whether it's a channel
-                self.processed_participants.add(participant.id)
+            
+            # Update last participants
+            self.last_participants = current_participants
             
             if channels_found > 0:
                 logger.info(f"Found and banned {channels_found} channels")
@@ -282,10 +287,10 @@ class ChannelBanMonitor:
             logger.error(f"Error in scan_for_channels: {e}")
 
     async def periodic_monitoring(self):
-        """Periodically scan for channels every 3-4 seconds"""
+        """Periodically scan for channels every 3 seconds"""
         logger.info("Starting periodic channel scanning...")
         
-        await self.send_log_message("🔄 Starting channel ban monitoring...\n🚫 All channels will be automatically banned.\n⚡ Scan interval: 3-4 seconds")
+        await self.send_log_message("🔄 Starting channel ban monitoring...\n🚫 All channels will be automatically banned.\n⚡ Scan interval: 3 seconds")
         
         scan_count = 0
         
@@ -297,16 +302,16 @@ class ChannelBanMonitor:
                 scan_count += 1
                 current_time = datetime.now().strftime('%H:%M:%S')
                 
-                # Log status every 10 scans to avoid spam
-                if scan_count % 10 == 0:
+                # Log status every 5 scans to avoid spam
+                if scan_count % 5 == 0:
                     logger.info(f"Scan #{scan_count} completed at {current_time} - {len(self.banned_channels)} total channels banned")
                 
-                # Fast scan interval: 3-4 seconds
-                await asyncio.sleep(3)  # 3 seconds between scans
+                # Fast scan interval: 3 seconds
+                await asyncio.sleep(3)
                 
             except Exception as e:
                 logger.error(f"Error in periodic monitoring: {e}")
-                await asyncio.sleep(3)  # Still wait only 3 seconds on error
+                await asyncio.sleep(3)
 
     async def send_log_message(self, message):
         """Send message to log group"""
