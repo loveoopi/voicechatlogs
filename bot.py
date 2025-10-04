@@ -4,7 +4,9 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
+from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator, Channel
+from telethon.tl.functions.channels import EditBannedRequest
+from telethon.tl.types import ChatBannedRights
 from telegram import Bot
 
 # Import config directly
@@ -40,6 +42,9 @@ class VoiceChatMonitor:
         self.last_participants = {}
         self.admin_ids = set()  # Store admin user IDs
         
+        # Track already banned channels to avoid duplicate actions
+        self.banned_channels = set()
+        
         logger.info("Voice Chat Monitor initialized")
 
     async def start(self):
@@ -64,7 +69,7 @@ class VoiceChatMonitor:
             # Get admin list
             await self.get_admin_list()
             
-            # Get initial participants
+            # Get initial participants and check for channels
             await self.get_voice_chat_participants()
             
             # Start periodic monitoring
@@ -113,14 +118,139 @@ class VoiceChatMonitor:
         except Exception as e:
             logger.error(f"Error getting admin list: {e}")
 
+    async def is_channel(self, participant):
+        """Check if a participant is a channel"""
+        try:
+            # Check if the participant is a Channel (not a user)
+            if isinstance(participant, Channel):
+                return True
+            
+            # Check user attributes that indicate it's a channel
+            user = await self.client.get_entity(participant.id)
+            if hasattr(user, 'broadcast') and user.broadcast:
+                return True
+            if hasattr(user, 'megagroup') and user.megagroup:
+                return True
+            if hasattr(user, 'username') and user.username and 'channel' in user.username.lower():
+                return True
+                
+            return False
+        except Exception as e:
+            logger.error(f"Error checking if participant is channel: {e}")
+            return False
+
+    async def ban_channel(self, channel_id, channel_info):
+        """Ban a channel from the group"""
+        try:
+            if channel_id in self.banned_channels:
+                logger.info(f"Channel {channel_id} already banned, skipping")
+                return False
+
+            # Create banned rights (ban forever)
+            banned_rights = ChatBannedRights(
+                until_date=None,  # Forever
+                view_messages=True,
+                send_messages=True,
+                send_media=True,
+                send_stickers=True,
+                send_gifs=True,
+                send_games=True,
+                send_inline=True,
+                embed_links=True,
+                send_polls=True,
+                change_info=True,
+                invite_users=True,
+                pin_messages=True
+            )
+
+            # Ban the channel
+            await self.client(EditBannedRequest(
+                channel=self.voice_chat_group_id,
+                participant=channel_id,
+                banned_rights=banned_rights
+            ))
+            
+            self.banned_channels.add(channel_id)
+            
+            # Log the ban action
+            await self.log_channel_ban(channel_info)
+            
+            logger.info(f"Successfully banned channel: {channel_info['name']} (ID: {channel_id})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error banning channel {channel_id}: {e}")
+            await self.send_log_message(f"❌ Failed to ban channel {channel_info['name']}: {str(e)}")
+            return False
+
+    async def log_channel_ban(self, channel_info):
+        """Log channel ban details"""
+        try:
+            message = f"🚫 CHANNEL BANNED FROM VOICE CHAT\n"
+            message += f"📢 Channel Name: {channel_info['name']}\n"
+            message += f"🆔 Channel ID: {channel_info['id']}\n"
+            
+            if channel_info.get('username'):
+                message += f"👤 Username: @{channel_info['username']}\n"
+            
+            message += f"⏰ Banned at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            message += f"🔒 Action: Permanently banned from group"
+            
+            await self.send_log_message(message)
+            logger.info(f"Channel ban logged: {channel_info['name']}")
+            
+        except Exception as e:
+            logger.error(f"Error logging channel ban: {e}")
+
+    async def check_and_ban_channels(self, participants):
+        """Check participants and ban any channels"""
+        try:
+            for participant in participants:
+                # Skip if it's a bot
+                if participant.bot:
+                    continue
+                
+                # Check if participant is a channel
+                if await self.is_channel(participant):
+                    user_id = participant.id
+                    username = getattr(participant, 'username', '')
+                    first_name = getattr(participant, 'first_name', '')
+                    last_name = getattr(participant, 'last_name', '')
+                    title = getattr(participant, 'title', '')
+                    
+                    # Create display name
+                    if title:
+                        display_name = title
+                    elif first_name and last_name:
+                        display_name = f"{first_name} {last_name}"
+                    elif first_name:
+                        display_name = first_name
+                    else:
+                        display_name = f"Channel{user_id}"
+                    
+                    channel_info = {
+                        'id': user_id,
+                        'name': display_name,
+                        'username': username
+                    }
+                    
+                    # Ban the channel immediately
+                    await self.ban_channel(user_id, channel_info)
+                    
+        except Exception as e:
+            logger.error(f"Error in check_and_ban_channels: {e}")
+
     async def get_voice_chat_participants(self):
-        """Get current voice chat participants"""
+        """Get current voice chat participants and ban any channels"""
         try:
             # Get the group entity
             group = await self.client.get_entity(self.voice_chat_group_id)
             
             # Get all participants in the group
             participants = await self.client.get_participants(group)
+            
+            # Check and ban any channels immediately
+            await self.check_and_ban_channels(participants)
             
             current_participants = {}
             
@@ -130,6 +260,10 @@ class VoiceChatMonitor:
                     username = getattr(participant, 'username', '')
                     first_name = getattr(participant, 'first_name', '')
                     last_name = getattr(participant, 'last_name', '')
+                    
+                    # Skip if it's a channel (should be banned by now)
+                    if await self.is_channel(participant):
+                        continue
                     
                     # Create display name
                     if first_name and last_name:
@@ -143,8 +277,6 @@ class VoiceChatMonitor:
                     is_admin = user_id in self.admin_ids
                     
                     # Simulate speaking status (in real implementation, you'd get this from voice chat)
-                    # For demo: randomly set some users as speaking (not muted)
-                    # In production, replace this with actual voice chat status
                     is_speaking = not is_admin and (user_id % 3 == 0)  # Demo: 1/3 of non-admin users are "speaking"
                     
                     current_participants[user_id] = {
@@ -219,7 +351,7 @@ class VoiceChatMonitor:
         """Periodically check voice chat status"""
         logger.info("Starting periodic monitoring...")
         
-        await self.send_log_message("🔄 Starting voice chat monitoring...\n⚡ Only non-admin speaking activity will be logged.")
+        await self.send_log_message("🔄 Starting voice chat monitoring...\n⚡ Only non-admin speaking activity will be logged.\n🚫 Channels will be automatically banned.")
         
         while True:
             try:
@@ -228,7 +360,7 @@ class VoiceChatMonitor:
                 
                 current_time = datetime.now().strftime('%H:%M:%S')
                 active_speakers = len([uid for uid, state in self.user_states.items() if state.get('speaking') and not state.get('is_admin')])
-                logger.info(f"Monitoring active at {current_time} - {active_speakers} non-admin users speaking")
+                logger.info(f"Monitoring active at {current_time} - {active_speakers} non-admin users speaking - {len(self.banned_channels)} channels banned")
                 
                 await asyncio.sleep(CHECK_INTERVAL)
                 
