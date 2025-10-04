@@ -1,16 +1,16 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from collections import defaultdict, deque
+from datetime import datetime
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator, Channel
+from telethon.tl.types import Channel
 from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.types import ChatBannedRights
+from telethon.errors import FloodWaitError
 from telegram import Bot
 
 # Import config directly
-from config import API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, LOG_GROUP_ID, VOICE_CHAT_GROUP_ID, CHECK_INTERVAL, MUTE_SPAM_THRESHOLD, TIME_WINDOW
+from config import API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, LOG_GROUP_ID, VOICE_CHAT_GROUP_ID, CHECK_INTERVAL
 
 # Setup logging
 logging.basicConfig(
@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class VoiceChatMonitor:
+class ChannelBanMonitor:
     def __init__(self):
         logger.info(f"Initializing with session string: {SESSION_STRING[:50]}...")
         
@@ -36,16 +36,15 @@ class VoiceChatMonitor:
         self.log_group_id = LOG_GROUP_ID
         self.voice_chat_group_id = VOICE_CHAT_GROUP_ID
         
-        # Track user states
-        self.user_states = {}  # user_id -> {muted: bool, last_update: datetime, name: str, username: str, is_admin: bool}
-        self.mute_history = defaultdict(lambda: deque(maxlen=10))
-        self.last_participants = {}
-        self.admin_ids = set()  # Store admin user IDs
-        
-        # Track already banned channels to avoid duplicate actions
+        # Track banned channels to avoid duplicate actions
         self.banned_channels = set()
+        self.processed_participants = set()
         
-        logger.info("Voice Chat Monitor initialized")
+        # Flood control
+        self.last_participant_check = None
+        self.min_check_interval = 10  # Minimum seconds between checks
+        
+        logger.info("Channel Ban Monitor initialized")
 
     async def start(self):
         """Start the monitoring service"""
@@ -61,24 +60,18 @@ class VoiceChatMonitor:
             logger.info(f"Logged in as: {me.first_name} (@{me.username})")
             
             # Send startup message
-            await self.send_log_message(f"🚀 Voice Chat Monitor Started!\nLogged in as: {me.first_name} (@{me.username})")
+            await self.send_log_message(f"🚀 Channel Ban Monitor Started!\nLogged in as: {me.first_name} (@{me.username})")
             
             # Get group info
             await self.get_group_info()
             
-            # Get admin list
-            await self.get_admin_list()
-            
-            # Get initial participants and check for channels
-            await self.get_voice_chat_participants()
-            
             # Start periodic monitoring
             asyncio.create_task(self.periodic_monitoring())
             
-            logger.info("Voice Chat Monitor started successfully")
+            logger.info("Channel Ban Monitor started successfully")
             
             # Keep the client running
-            await asyncio.Future()  # Run forever
+            await asyncio.Future()
             
         except Exception as e:
             logger.error(f"Failed to start: {str(e)}")
@@ -88,55 +81,61 @@ class VoiceChatMonitor:
     async def get_group_info(self):
         """Get basic group information"""
         try:
-            # Get the group entity
             group = await self.client.get_entity(self.voice_chat_group_id)
             group_title = getattr(group, 'title', 'Unknown Group')
             logger.info(f"Monitoring group: {group_title}")
             
-            await self.send_log_message(f"📞 Monitoring voice chat in: {group_title}")
+            await self.send_log_message(f"📞 Monitoring voice chat in: {group_title}\n🚫 Auto-banning all channels")
             
         except Exception as e:
             logger.error(f"Error getting group info: {e}")
             await self.send_log_message(f"❌ Error accessing group: {e}")
 
-    async def get_admin_list(self):
-        """Get list of admin users to exclude from logging"""
+    async def is_channel(self, user):
+        """Check if a user is a channel with multiple detection methods"""
         try:
-            group = await self.client.get_entity(self.voice_chat_group_id)
-            participants = await self.client.get_participants(group)
-            
-            admin_ids = set()
-            
-            for participant in participants:
-                if (isinstance(participant.participant, (ChannelParticipantAdmin, ChannelParticipantCreator))):
-                    admin_ids.add(participant.id)
-                    logger.info(f"Admin found: {getattr(participant, 'first_name', '')} (@{getattr(participant, 'username', '')})")
-            
-            self.admin_ids = admin_ids
-            logger.info(f"Loaded {len(admin_ids)} admins to exclude from logging")
-            
-        except Exception as e:
-            logger.error(f"Error getting admin list: {e}")
-
-    async def is_channel(self, participant):
-        """Check if a participant is a channel"""
-        try:
-            # Check if the participant is a Channel (not a user)
-            if isinstance(participant, Channel):
+            # Method 1: Check if it's a Channel type
+            if isinstance(user, Channel):
                 return True
             
-            # Check user attributes that indicate it's a channel
-            user = await self.client.get_entity(participant.id)
+            # Method 2: Check user attributes
+            if hasattr(user, 'bot') and user.bot:
+                return False  # Skip bots
+                
+            # Method 3: Check for channel-specific attributes
             if hasattr(user, 'broadcast') and user.broadcast:
                 return True
+                
             if hasattr(user, 'megagroup') and user.megagroup:
                 return True
-            if hasattr(user, 'username') and user.username and 'channel' in user.username.lower():
+                
+            # Method 4: Check username patterns
+            if hasattr(user, 'username') and user.username:
+                username_lower = user.username.lower()
+                if any(pattern in username_lower for pattern in ['channel', 'chat', 'group', 'bot']):
+                    return True
+                    
+            # Method 5: Check if first_name/last_name suggests it's a channel
+            first_name = getattr(user, 'first_name', '').lower()
+            last_name = getattr(user, 'last_name', '').lower()
+            full_name = f"{first_name} {last_name}".strip()
+            
+            channel_keywords = ['channel', 'chat', 'group', 'news', 'broadcast', 'telegram']
+            if any(keyword in full_name for keyword in channel_keywords):
+                return True
+                
+            # Method 6: Check if it has no first name but has username (common for channels)
+            if not first_name and not last_name and hasattr(user, 'username') and user.username:
+                return True
+                
+            # Method 7: Check for verified channels
+            if hasattr(user, 'verified') and user.verified:
                 return True
                 
             return False
+            
         except Exception as e:
-            logger.error(f"Error checking if participant is channel: {e}")
+            logger.error(f"Error checking if user is channel: {e}")
             return False
 
     async def ban_channel(self, channel_id, channel_info):
@@ -148,7 +147,7 @@ class VoiceChatMonitor:
 
             # Create banned rights (ban forever)
             banned_rights = ChatBannedRights(
-                until_date=None,  # Forever
+                until_date=None,
                 view_messages=True,
                 send_messages=True,
                 send_media=True,
@@ -178,6 +177,10 @@ class VoiceChatMonitor:
             logger.info(f"Successfully banned channel: {channel_info['name']} (ID: {channel_id})")
             return True
             
+        except FloodWaitError as e:
+            logger.warning(f"Flood wait when banning channel {channel_id}: {e.seconds}s")
+            await asyncio.sleep(e.seconds)
+            return await self.ban_channel(channel_id, channel_info)
         except Exception as e:
             logger.error(f"Error banning channel {channel_id}: {e}")
             await self.send_log_message(f"❌ Failed to ban channel {channel_info['name']}: {str(e)}")
@@ -188,11 +191,14 @@ class VoiceChatMonitor:
         try:
             message = f"🚫 CHANNEL BANNED FROM VOICE CHAT\n"
             message += f"📢 Channel Name: {channel_info['name']}\n"
-            message += f"🆔 Channel ID: {channel_info['id']}\n"
+            message += f"🆔 Channel ID: `{channel_info['id']}`\n"
             
             if channel_info.get('username'):
                 message += f"👤 Username: @{channel_info['username']}\n"
+            else:
+                message += f"👤 Username: No username\n"
             
+            message += f"📞 Type: {'Public' if channel_info.get('username') else 'Private'} channel\n"
             message += f"⏰ Banned at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             message += f"🔒 Action: Permanently banned from group"
             
@@ -202,15 +208,40 @@ class VoiceChatMonitor:
         except Exception as e:
             logger.error(f"Error logging channel ban: {e}")
 
-    async def check_and_ban_channels(self, participants):
-        """Check participants and ban any channels"""
+    async def scan_for_channels(self):
+        """Scan voice chat for channels and ban them immediately"""
         try:
-            for participant in participants:
-                # Skip if it's a bot
+            # Check if we should skip due to flood control
+            current_time = datetime.now()
+            if (self.last_participant_check and 
+                (current_time - self.last_participant_check).total_seconds() < self.min_check_interval):
+                return
+                
+            self.last_participant_check = current_time
+            
+            group = await self.client.get_entity(self.voice_chat_group_id)
+            
+            # Get recent participants
+            recent_participants = []
+            try:
+                async for user in self.client.iter_participants(group, limit=100):
+                    recent_participants.append(user)
+            except FloodWaitError as e:
+                logger.warning(f"Flood wait getting participants: {e.seconds}s")
+                await asyncio.sleep(e.seconds)
+                return
+            
+            channels_found = 0
+            
+            for participant in recent_participants:
                 if participant.bot:
                     continue
-                
-                # Check if participant is a channel
+                    
+                # Skip if already processed
+                if participant.id in self.processed_participants:
+                    continue
+                    
+                # Check if it's a channel
                 if await self.is_channel(participant):
                     user_id = participant.id
                     username = getattr(participant, 'username', '')
@@ -235,138 +266,39 @@ class VoiceChatMonitor:
                     }
                     
                     # Ban the channel immediately
-                    await self.ban_channel(user_id, channel_info)
-                    
+                    success = await self.ban_channel(user_id, channel_info)
+                    if success:
+                        channels_found += 1
+                
+                # Mark as processed
+                self.processed_participants.add(participant.id)
+            
+            if channels_found > 0:
+                logger.info(f"Found and banned {channels_found} channels")
+                
         except Exception as e:
-            logger.error(f"Error in check_and_ban_channels: {e}")
-
-    async def get_voice_chat_participants(self):
-        """Get current voice chat participants and ban any channels"""
-        try:
-            # Get the group entity
-            group = await self.client.get_entity(self.voice_chat_group_id)
-            
-            # Get all participants in the group
-            participants = await self.client.get_participants(group)
-            
-            # Check and ban any channels immediately
-            await self.check_and_ban_channels(participants)
-            
-            current_participants = {}
-            
-            for participant in participants:
-                if not participant.bot:  # Ignore bots
-                    user_id = participant.id
-                    username = getattr(participant, 'username', '')
-                    first_name = getattr(participant, 'first_name', '')
-                    last_name = getattr(participant, 'last_name', '')
-                    
-                    # Skip if it's a channel (should be banned by now)
-                    if await self.is_channel(participant):
-                        continue
-                    
-                    # Create display name
-                    if first_name and last_name:
-                        full_name = f"{first_name} {last_name}"
-                    elif first_name:
-                        full_name = first_name
-                    else:
-                        full_name = f"User{user_id}"
-                    
-                    # Check if user is admin
-                    is_admin = user_id in self.admin_ids
-                    
-                    # Simulate speaking status (in real implementation, you'd get this from voice chat)
-                    is_speaking = not is_admin and (user_id % 3 == 0)  # Demo: 1/3 of non-admin users are "speaking"
-                    
-                    current_participants[user_id] = {
-                        'name': full_name,
-                        'username': username,
-                        'muted': not is_speaking,  # If speaking, not muted
-                        'last_seen': datetime.now(),
-                        'is_admin': is_admin,
-                        'speaking': is_speaking
-                    }
-            
-            # Compare with previous participants to detect changes
-            await self.detect_speaking_changes(current_participants)
-            
-            self.last_participants = current_participants
-            return current_participants
-            
-        except Exception as e:
-            logger.error(f"Error getting participants: {e}")
-            return {}
-
-    async def detect_speaking_changes(self, current_participants):
-        """Detect when non-admin users start/stop speaking"""
-        try:
-            current_time = datetime.now()
-            
-            # Check for speaking status changes
-            for user_id, user_info in current_participants.items():
-                # Skip admins - we don't log their speaking activity
-                if user_info['is_admin']:
-                    continue
-                    
-                if user_id not in self.user_states:
-                    # New user detected - only log if they're speaking
-                    if user_info['speaking']:
-                        await self.log_user_speaking(user_info, current_time)
-                    
-                    self.user_states[user_id] = {
-                        'muted': user_info['muted'],
-                        'speaking': user_info['speaking'],
-                        'last_update': current_time,
-                        'name': user_info['name'],
-                        'username': user_info['username'],
-                        'is_admin': user_info['is_admin']
-                    }
-                else:
-                    # Check for speaking status changes
-                    old_speaking = self.user_states[user_id]['speaking']
-                    new_speaking = user_info['speaking']
-                    
-                    if not old_speaking and new_speaking:
-                        # User started speaking
-                        await self.log_user_speaking(user_info, current_time)
-                        self.user_states[user_id]['speaking'] = True
-                        self.user_states[user_id]['last_update'] = current_time
-                        
-                    elif old_speaking and not new_speaking:
-                        # User stopped speaking
-                        await self.log_user_stopped_speaking(user_info, current_time)
-                        self.user_states[user_id]['speaking'] = False
-                        self.user_states[user_id]['last_update'] = current_time
-            
-            # Check for users who left (cleanup)
-            for user_id in list(self.user_states.keys()):
-                if user_id not in current_participants:
-                    del self.user_states[user_id]
-                    
-        except Exception as e:
-            logger.error(f"Error detecting speaking changes: {e}")
+            logger.error(f"Error in scan_for_channels: {e}")
 
     async def periodic_monitoring(self):
-        """Periodically check voice chat status"""
-        logger.info("Starting periodic monitoring...")
+        """Periodically scan for channels"""
+        logger.info("Starting periodic channel scanning...")
         
-        await self.send_log_message("🔄 Starting voice chat monitoring...\n⚡ Only non-admin speaking activity will be logged.\n🚫 Channels will be automatically banned.")
+        await self.send_log_message("🔄 Starting channel ban monitoring...\n🚫 All channels will be automatically banned.")
         
         while True:
             try:
-                # Get current participants and check for changes
-                await self.get_voice_chat_participants()
+                # Scan for channels
+                await self.scan_for_channels()
                 
                 current_time = datetime.now().strftime('%H:%M:%S')
-                active_speakers = len([uid for uid, state in self.user_states.items() if state.get('speaking') and not state.get('is_admin')])
-                logger.info(f"Monitoring active at {current_time} - {active_speakers} non-admin users speaking - {len(self.banned_channels)} channels banned")
+                logger.info(f"Channel scan completed at {current_time} - {len(self.banned_channels)} total channels banned")
                 
+                # Use config interval
                 await asyncio.sleep(CHECK_INTERVAL)
                 
             except Exception as e:
                 logger.error(f"Error in periodic monitoring: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)  # Wait 30 seconds on error
 
     async def send_log_message(self, message):
         """Send message to log group"""
@@ -375,39 +307,9 @@ class VoiceChatMonitor:
                 chat_id=self.log_group_id,
                 text=message
             )
-            logger.info(f"Message sent to log group: {message[:50]}...")
+            logger.info(f"Log message sent: {message[:50]}...")
         except Exception as e:
             logger.error(f"Error sending log message: {e}")
-
-    async def log_user_speaking(self, user_info, timestamp):
-        """Log when a non-admin user starts speaking"""
-        try:
-            message = f"🎤 MIC ON - User Started Speaking\n"
-            message += f"Name: {user_info['name']}\n"
-            if user_info['username']:
-                message += f"Username: @{user_info['username']}\n"
-            message += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            await self.send_log_message(message)
-            logger.info(f"User {user_info['name']} started speaking at {timestamp}")
-            
-        except Exception as e:
-            logger.error(f"Error logging user speaking: {e}")
-
-    async def log_user_stopped_speaking(self, user_info, timestamp):
-        """Log when a non-admin user stops speaking"""
-        try:
-            message = f"🔇 MIC OFF - User Stopped Speaking\n"
-            message += f"Name: {user_info['name']}\n"
-            if user_info['username']:
-                message += f"Username: @{user_info['username']}\n"
-            message += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            await self.send_log_message(message)
-            logger.info(f"User {user_info['name']} stopped speaking at {timestamp}")
-            
-        except Exception as e:
-            logger.error(f"Error logging user stopped speaking: {e}")
 
     async def cleanup(self):
         """Cleanup resources"""
@@ -418,7 +320,7 @@ class VoiceChatMonitor:
             logger.error(f"Error during cleanup: {e}")
 
 async def main():
-    monitor = VoiceChatMonitor()
+    monitor = ChannelBanMonitor()
     try:
         await monitor.start()
     except KeyboardInterrupt:
