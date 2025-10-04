@@ -35,9 +35,10 @@ class VoiceChatMonitor:
         self.voice_chat_group_id = VOICE_CHAT_GROUP_ID
         
         # Track user states
-        self.user_states = {}  # user_id -> {muted: bool, last_update: datetime, name: str, username: str}
+        self.user_states = {}  # user_id -> {muted: bool, last_update: datetime, name: str, username: str, is_admin: bool}
         self.mute_history = defaultdict(lambda: deque(maxlen=10))
         self.last_participants = {}
+        self.admin_ids = set()  # Store admin user IDs
         
         logger.info("Voice Chat Monitor initialized")
 
@@ -59,6 +60,9 @@ class VoiceChatMonitor:
             
             # Get group info
             await self.get_group_info()
+            
+            # Get admin list
+            await self.get_admin_list()
             
             # Get initial participants
             await self.get_voice_chat_participants()
@@ -90,6 +94,25 @@ class VoiceChatMonitor:
             logger.error(f"Error getting group info: {e}")
             await self.send_log_message(f"❌ Error accessing group: {e}")
 
+    async def get_admin_list(self):
+        """Get list of admin users to exclude from logging"""
+        try:
+            group = await self.client.get_entity(self.voice_chat_group_id)
+            participants = await self.client.get_participants(group)
+            
+            admin_ids = set()
+            
+            for participant in participants:
+                if (isinstance(participant.participant, (ChannelParticipantAdmin, ChannelParticipantCreator))):
+                    admin_ids.add(participant.id)
+                    logger.info(f"Admin found: {getattr(participant, 'first_name', '')} (@{getattr(participant, 'username', '')})")
+            
+            self.admin_ids = admin_ids
+            logger.info(f"Loaded {len(admin_ids)} admins to exclude from logging")
+            
+        except Exception as e:
+            logger.error(f"Error getting admin list: {e}")
+
     async def get_voice_chat_participants(self):
         """Get current voice chat participants"""
         try:
@@ -116,17 +139,25 @@ class VoiceChatMonitor:
                     else:
                         full_name = f"User{user_id}"
                     
-                    # For now, we'll assume all participants are muted (since we can't get real voice chat status via regular API)
-                    # In a real implementation, you'd need to use voice chat specific methods
+                    # Check if user is admin
+                    is_admin = user_id in self.admin_ids
+                    
+                    # Simulate speaking status (in real implementation, you'd get this from voice chat)
+                    # For demo: randomly set some users as speaking (not muted)
+                    # In production, replace this with actual voice chat status
+                    is_speaking = not is_admin and (user_id % 3 == 0)  # Demo: 1/3 of non-admin users are "speaking"
+                    
                     current_participants[user_id] = {
                         'name': full_name,
                         'username': username,
-                        'muted': True,  # Default assumption
-                        'last_seen': datetime.now()
+                        'muted': not is_speaking,  # If speaking, not muted
+                        'last_seen': datetime.now(),
+                        'is_admin': is_admin,
+                        'speaking': is_speaking
                     }
             
             # Compare with previous participants to detect changes
-            await self.detect_participant_changes(current_participants)
+            await self.detect_speaking_changes(current_participants)
             
             self.last_participants = current_participants
             return current_participants
@@ -135,52 +166,60 @@ class VoiceChatMonitor:
             logger.error(f"Error getting participants: {e}")
             return {}
 
-    async def detect_participant_changes(self, current_participants):
-        """Detect changes in participants and their states"""
+    async def detect_speaking_changes(self, current_participants):
+        """Detect when non-admin users start/stop speaking"""
         try:
             current_time = datetime.now()
             
-            # Check for new participants
+            # Check for speaking status changes
             for user_id, user_info in current_participants.items():
+                # Skip admins - we don't log their speaking activity
+                if user_info['is_admin']:
+                    continue
+                    
                 if user_id not in self.user_states:
-                    # New user detected
-                    await self.log_user_joined(user_info)
+                    # New user detected - only log if they're speaking
+                    if user_info['speaking']:
+                        await self.log_user_speaking(user_info, current_time)
+                    
                     self.user_states[user_id] = {
                         'muted': user_info['muted'],
+                        'speaking': user_info['speaking'],
                         'last_update': current_time,
                         'name': user_info['name'],
-                        'username': user_info['username']
+                        'username': user_info['username'],
+                        'is_admin': user_info['is_admin']
                     }
                 else:
-                    # Check for mute status changes
-                    old_muted = self.user_states[user_id]['muted']
-                    new_muted = user_info['muted']
+                    # Check for speaking status changes
+                    old_speaking = self.user_states[user_id]['speaking']
+                    new_speaking = user_info['speaking']
                     
-                    if old_muted != new_muted:
-                        await self.log_mute_change(user_info, new_muted, current_time)
-                        self.user_states[user_id]['muted'] = new_muted
+                    if not old_speaking and new_speaking:
+                        # User started speaking
+                        await self.log_user_speaking(user_info, current_time)
+                        self.user_states[user_id]['speaking'] = True
                         self.user_states[user_id]['last_update'] = current_time
                         
-                        # Track mute history for spam detection
-                        self.mute_history[user_id].append(current_time)
-                        await self.check_mute_spam(user_id, user_info)
+                    elif old_speaking and not new_speaking:
+                        # User stopped speaking
+                        await self.log_user_stopped_speaking(user_info, current_time)
+                        self.user_states[user_id]['speaking'] = False
+                        self.user_states[user_id]['last_update'] = current_time
             
-            # Check for left participants
+            # Check for users who left (cleanup)
             for user_id in list(self.user_states.keys()):
                 if user_id not in current_participants:
-                    # User left
-                    user_info = self.user_states[user_id]
-                    await self.log_user_left(user_info)
                     del self.user_states[user_id]
                     
         except Exception as e:
-            logger.error(f"Error detecting participant changes: {e}")
+            logger.error(f"Error detecting speaking changes: {e}")
 
     async def periodic_monitoring(self):
         """Periodically check voice chat status"""
         logger.info("Starting periodic monitoring...")
         
-        await self.send_log_message("🔄 Starting voice chat monitoring...")
+        await self.send_log_message("🔄 Starting voice chat monitoring...\n⚡ Only non-admin speaking activity will be logged.")
         
         while True:
             try:
@@ -188,8 +227,8 @@ class VoiceChatMonitor:
                 await self.get_voice_chat_participants()
                 
                 current_time = datetime.now().strftime('%H:%M:%S')
-                active_users = len(self.user_states)
-                logger.info(f"Monitoring active at {current_time} - {active_users} users in voice chat")
+                active_speakers = len([uid for uid, state in self.user_states.items() if state.get('speaking') and not state.get('is_admin')])
+                logger.info(f"Monitoring active at {current_time} - {active_speakers} non-admin users speaking")
                 
                 await asyncio.sleep(CHECK_INTERVAL)
                 
@@ -208,81 +247,35 @@ class VoiceChatMonitor:
         except Exception as e:
             logger.error(f"Error sending log message: {e}")
 
-    async def log_user_joined(self, user_info):
-        """Log when a user joins voice chat"""
+    async def log_user_speaking(self, user_info, timestamp):
+        """Log when a non-admin user starts speaking"""
         try:
-            message = f"👤 User Joined Voice Chat\n"
+            message = f"🎤 MIC ON - User Started Speaking\n"
             message += f"Name: {user_info['name']}\n"
             if user_info['username']:
                 message += f"Username: @{user_info['username']}\n"
-            message += f"User ID: {hash(str(user_info['name']))}...\n"  # Hashed for privacy
-            message += f"Status: {'🎤 SPEAKING' if not user_info['muted'] else '🔇 Muted'}\n"
-            message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            await self.send_log_message(message)
-            logger.info(f"User {user_info['name']} joined voice chat")
-            
-        except Exception as e:
-            logger.error(f"Error logging user join: {e}")
-
-    async def log_user_left(self, user_info):
-        """Log when a user leaves voice chat"""
-        try:
-            message = f"🚪 User Left Voice Chat\n"
-            message += f"Name: {user_info['name']}\n"
-            if user_info.get('username'):
-                message += f"Username: @{user_info['username']}\n"
-            message += f"User ID: {hash(str(user_info['name']))}...\n"
-            message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            await self.send_log_message(message)
-            logger.info(f"User {user_info['name']} left voice chat")
-            
-        except Exception as e:
-            logger.error(f"Error logging user left: {e}")
-
-    async def log_mute_change(self, user_info, is_muted, timestamp):
-        """Log when a user mutes/unmutes"""
-        try:
-            action = "unmuted" if not is_muted else "muted"
-            emoji = "🎤" if not is_muted else "🔇"
-            
-            message = f"{emoji} User {action.upper()}\n"
-            message += f"Name: {user_info['name']}\n"
-            if user_info['username']:
-                message += f"Username: @{user_info['username']}\n"
-            message += f"User ID: {hash(str(user_info['name']))}...\n"
             message += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
             
             await self.send_log_message(message)
-            logger.info(f"User {user_info['name']} {action} at {timestamp}")
+            logger.info(f"User {user_info['name']} started speaking at {timestamp}")
             
         except Exception as e:
-            logger.error(f"Error logging mute change: {e}")
+            logger.error(f"Error logging user speaking: {e}")
 
-    async def check_mute_spam(self, user_id, user_info):
-        """Check if user is spamming mute/unmute"""
+    async def log_user_stopped_speaking(self, user_info, timestamp):
+        """Log when a non-admin user stops speaking"""
         try:
-            history = self.mute_history[user_id]
-            current_time = datetime.now()
-            time_window = current_time - timedelta(seconds=TIME_WINDOW)
+            message = f"🔇 MIC OFF - User Stopped Speaking\n"
+            message += f"Name: {user_info['name']}\n"
+            if user_info['username']:
+                message += f"Username: @{user_info['username']}\n"
+            message += f"Time: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
             
-            recent_actions = len([t for t in history if t > time_window])
+            await self.send_log_message(message)
+            logger.info(f"User {user_info['name']} stopped speaking at {timestamp}")
             
-            if recent_actions >= MUTE_SPAM_THRESHOLD:
-                message = f"🚨 MUTE/UNMUTE SPAM DETECTED\n"
-                message += f"User: {user_info['name']}\n"
-                if user_info['username']:
-                    message += f"Username: @{user_info['username']}\n"
-                message += f"Actions: {recent_actions} in {TIME_WINDOW} seconds\n"
-                message += f"Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                
-                await self.send_log_message(message)
-                logger.warning(f"Mute spam detected for user {user_info['name']}")
-                self.mute_history[user_id].clear()
-                
         except Exception as e:
-            logger.error(f"Error checking mute spam: {e}")
+            logger.error(f"Error logging user stopped speaking: {e}")
 
     async def cleanup(self):
         """Cleanup resources"""
